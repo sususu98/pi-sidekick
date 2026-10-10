@@ -111,6 +111,32 @@ test("production errors: model failure, task timeout, report bounds and missing-
   } finally { await h.finish(); }
 }, 60_000);
 
+test("production lock lifecycle: multiple native Bash, Lead write and /fixture_reload cycles under actual Pi host", async () => {
+  const h = await harness();
+  try {
+    await h.start();
+    for (let cycle = 1; cycle <= 3; cycle++) {
+      // 1. Native bash through user_bash hook (claims and releases workspace writer lease)
+      const bashResult = await h.peer.request({ type: "bash", command: `printf "cycle-${cycle}" > cycle-${cycle}.txt` });
+      expect(bashResult.exitCode).toBe(0);
+      expect(await readFile(join(h.cwd, `cycle-${cycle}.txt`), "utf8")).toBe(`cycle-${cycle}`);
+      expect(await access(join(h.cwd, ".pi", "sidekick-writer.lock")).then(() => true, () => false)).toBe(false);
+
+      // 2. Lead native write tool execution (claims and releases workspace writer lease)
+      await h.run("LEAD_WRITE");
+      expect(await readFile(join(h.cwd, "lead-write.txt"), "utf8")).toBe("lead mutation");
+      expect(await access(join(h.cwd, ".pi", "sidekick-writer.lock")).then(() => true, () => false)).toBe(false);
+
+      // 3. /fixture_reload: reloads extension context in actual Pi host
+      await h.command("/fixture_reload");
+      expect(await access(join(h.cwd, ".pi", "sidekick-writer.lock")).then(() => true, () => false)).toBe(false);
+    }
+  } finally {
+    await h.finish();
+  }
+}, 60_000);
+
+
 test("production fails closed for absent worker provider, identical models and missing registered model", async () => {
   for (const overrides of [
     { providerExtensions: [] },

@@ -2,3 +2,4 @@ node_modules/
 .DS_Store
 *.log
 .pi/sidekick-writer.lock/
+.pi/sidekick-writer.lock.gate/

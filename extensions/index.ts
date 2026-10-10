@@ -1,12 +1,15 @@
 import { join } from "node:path";
 import { mkdir } from "node:fs/promises";
 import { writeSync } from "node:fs";
-import lockfile from "proper-lockfile";
+import { acquireFileLock } from "./lock.ts";
 import { Type } from "typebox";
 import { createLocalBashOperations, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { DEFAULT_CONFIG, loadConfig, parseConfig, parseModelSpec, sameModel, type SidekickConfig } from "./config.ts";
 import { CHECKPOINT_TYPE, PersistentWorker, restoreCheckpoint } from "./worker.ts";
 import { collectUsage, totalUsage } from "./usage.ts";
+import { SidekickConversationView } from "./ui/view.ts";
+import { TranscriptProjection } from "./ui/projection.ts";
 
 const CONFIG_TYPE = "pi-sidekick.config.v1";
 export default function sidekickExtension(pi: ExtensionAPI): void {
@@ -14,6 +17,12 @@ export default function sidekickExtension(pi: ExtensionAPI): void {
   let worker: PersistentWorker | undefined;
   let configurationError: string | undefined;
   let unsafeLead: Error | undefined;
+  let viewDraft = "";
+  let viewScrollTop = 0;
+  let viewToolsExpanded = true;
+  let viewThinkingHidden = false;
+  let manualRunGeneration = 0;
+  let activeViewDone: (() => void) | undefined;
   const fatalStorageFailure = (): never => {
     // Native appendEntry mutates the in-memory tree before writing disk. There
     // is no public rollback API; returning to the agent could persist orphaned
@@ -48,7 +57,11 @@ export default function sidekickExtension(pi: ExtensionAPI): void {
     save: checkpoint => append(CHECKPOINT_TYPE, checkpoint, true),
   });
   const start = async (ctx: ExtensionContext, navigating = false) => {
+    manualRunGeneration++;
+    activeViewDone?.();
+    activeViewDone = undefined;
     await worker?.stop(); await releaseWriters(); worker = undefined; configurationError = undefined;
+    viewDraft = ""; viewScrollTop = 0;
     try {
       const saved = ctx.sessionManager.getBranch().findLast(e => e.type === "custom" && e.customType === CONFIG_TYPE);
       config = saved?.type === "custom" ? parseConfig(saved.data) : await loadConfig(ctx.cwd);
@@ -68,7 +81,13 @@ export default function sidekickExtension(pi: ExtensionAPI): void {
   pi.on("session_start", (_event, ctx) => start(ctx));
   pi.on("session_tree", (_event, ctx) => start(ctx, true));
   pi.on("agent_settled", async () => { await releaseWriters(); });
-  pi.on("session_shutdown", async () => { try { await worker?.stop(); } finally { worker = undefined; await releaseWriters(); } });
+  pi.on("session_shutdown", async () => {
+    manualRunGeneration++;
+    activeViewDone?.();
+    activeViewDone = undefined;
+    viewDraft = ""; viewScrollTop = 0;
+    try { await worker?.stop(); } finally { worker = undefined; await releaseWriters(); }
+  });
 
   // The Lead may still read evidence or make critical edits while the Worker is
   // idle. During execution, block potentially mutating sibling/nested tools.
@@ -82,7 +101,7 @@ export default function sidekickExtension(pi: ExtensionAPI): void {
     if ([...writerLeases.keys()].some(id => event.toolCallId.startsWith(id + "/"))) return;
     await mkdir(join(ctx.cwd, ".pi"), { recursive: true });
     try {
-      const release = await lockfile.lock(join(ctx.cwd, ".pi", "sidekick-writer"), { realpath: false, stale: 10_000, update: 2000, retries: 0, onCompromised: () => ctx.abort() });
+      const release = await acquireFileLock(join(ctx.cwd, ".pi", "sidekick-writer"), { stale: 10_000, update: 2000, onCompromised: () => ctx.abort() });
       writerLeases.set(event.toolCallId, release);
     } catch (error) {
       return { block: true, reason: "Workspace writer is owned by another Lead/Sidekick: " + String(error) };
@@ -92,7 +111,10 @@ export default function sidekickExtension(pi: ExtensionAPI): void {
     const release = writerLeases.get(event.toolCallId);
     if (!release) return;
     writerLeases.delete(event.toolCallId);
-    try { await release(); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ERELEASED") throw error; }
+    try { await release(); } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ERELEASED" && code !== "ECOMPROMISED" && code !== "ENOTACQUIRED") throw error;
+    }
   });
 
   pi.on("user_bash", (_event, ctx) => {
@@ -103,10 +125,16 @@ export default function sidekickExtension(pi: ExtensionAPI): void {
       const controller = new AbortController();
       let release: () => Promise<void>;
       try {
-        release = await lockfile.lock(join(ctx.cwd, ".pi", "sidekick-writer"), { realpath: false, stale: 10_000, update: 2000, retries: 0, onCompromised: error => controller.abort(error) });
+        release = await acquireFileLock(join(ctx.cwd, ".pi", "sidekick-writer"), { stale: 10_000, update: 2000, onCompromised: error => controller.abort(error) });
       } catch (error) { throw new Error("Workspace writer is owned by another Lead/Sidekick: " + String(error)); }
       try { return await local.exec(command, cwd, { ...options, signal: options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal }); }
-      finally { try { await release(); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ERELEASED") throw error; } }
+      finally {
+        try { await release(); }
+        catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code !== "ERELEASED" && code !== "ECOMPROMISED" && code !== "ENOTACQUIRED") throw error;
+        }
+      }
     } } };
   });
 
@@ -147,11 +175,166 @@ export default function sidekickExtension(pi: ExtensionAPI): void {
     },
   });
 
+  pi.registerMessageRenderer("pi-sidekick.manual-result", (message, _options, theme) => {
+    const text = typeof message.content === "string" ? message.content : "";
+    const details = (message.details as Record<string, unknown>) ?? {};
+    const status = details.status ?? "done";
+    const icon = status === "error" ? theme.fg("error", "✗") : status === "cancelled" ? theme.fg("warning", "⊘") : theme.fg("success", "✓");
+    return new Text(`${icon} ${theme.bold("Sidekick Manual Task")}\n${text}`, 0, 0);
+  });
+
+  const handleManualRun = async (brief: string, ctx: ExtensionContext): Promise<boolean> => {
+    if (configurationError) {
+      ctx.ui.notify("Sidekick disabled: " + configurationError, "error");
+      return false;
+    }
+    if (!config.enabled || !config.sidekick || !worker) {
+      ctx.ui.notify("Configure with /sidekick model provider/model-id high, then enable with /sidekick on", "warning");
+      return false;
+    }
+    const model = ctx.modelRegistry.find(config.sidekick.provider, config.sidekick.model);
+    if (!model) {
+      ctx.ui.notify("Configured Sidekick model is not registered in Pi", "error");
+      return false;
+    }
+    if (ctx.model?.provider === model.provider && ctx.model.id === model.id) {
+      ctx.ui.notify("Sidekick model must differ from Lead model", "error");
+      return false;
+    }
+
+    if (!ctx.isIdle() || writerLeases.size > 0) {
+      ctx.ui.notify("Cannot start Sidekick task: Lead is currently busy or holding workspace writer.", "error");
+      return false;
+    }
+
+    const taskGen = ++manualRunGeneration;
+    const currentWorker = worker;
+
+    void (async () => {
+      try {
+        ctx.ui.setStatus("pi-sidekick", "Sidekick · executing manual brief");
+        const result = await currentWorker.run({ brief }, undefined, (activity) => {
+          ctx.ui.setStatus("pi-sidekick", "Sidekick · " + activity);
+        });
+        if (taskGen !== manualRunGeneration) return;
+
+        pi.sendMessage(
+          {
+            customType: "pi-sidekick.manual-result",
+            content: result.report,
+            display: true,
+            details: {
+              status: result.status,
+              usage: result.usage,
+              durationMs: result.durationMs,
+              tasks: result.checkpoint?.tasks,
+              sessionId: result.checkpoint?.sessionId,
+            },
+          },
+          { triggerTurn: false }
+        );
+      } catch (err) {
+        if (taskGen !== manualRunGeneration) return;
+        pi.sendMessage(
+          {
+            customType: "pi-sidekick.manual-result",
+            content: `Sidekick manual task failed: ${String(err)}`,
+            display: true,
+            details: { status: "error", error: String(err) },
+          },
+          { triggerTurn: false }
+        );
+      } finally {
+        if (unsafeLead) fatalStorageFailure();
+        ctx.ui.setStatus("pi-sidekick", "Sidekick · idle");
+      }
+    })();
+
+    return true;
+  };
+
+  const openSidekickView = async (ctx: ExtensionContext): Promise<void> => {
+    if ((ctx as any).mode !== "tui") return;
+    if (!worker) {
+      ctx.ui.notify("Sidekick worker is not initialized", "error");
+      return;
+    }
+
+    const currentWorker = worker;
+    const currentGen = manualRunGeneration;
+
+    let projection: TranscriptProjection;
+    try {
+      projection = await currentWorker.hydrateView();
+    } catch (err) {
+      ctx.ui.notify(`Cannot open Sidekick session: ${String(err)}`, "error");
+      return;
+    }
+
+    // Close any previous view instance
+    activeViewDone?.();
+
+    await ctx.ui.custom<void>((tui, theme, kb, done) => {
+      activeViewDone = () => {
+        try { done(); } catch {}
+      };
+
+      return new SidekickConversationView({
+        tui,
+        theme,
+        kb,
+        done: () => {
+          if (activeViewDone) activeViewDone = undefined;
+          done();
+        },
+        projection,
+        cwd: ctx.cwd,
+        draft: viewDraft,
+        scrollTop: viewScrollTop,
+        toolsExpanded: viewToolsExpanded,
+        thinkingHidden: viewThinkingHidden,
+        onDraftChange: (d) => {
+          if (manualRunGeneration === currentGen) viewDraft = d;
+        },
+        onScrollChange: (st) => {
+          if (manualRunGeneration === currentGen) viewScrollTop = st;
+        },
+        onToolsExpandedChange: (e) => {
+          if (manualRunGeneration === currentGen) viewToolsExpanded = e;
+        },
+        onThinkingHiddenChange: (th) => {
+          if (manualRunGeneration === currentGen) viewThinkingHidden = th;
+        },
+        isBusy: () => currentWorker.busy,
+        onStop: async () => {
+          if (currentWorker.busy) await currentWorker.cancel();
+        },
+        onSteer: async (msg) => {
+          if (currentWorker.busy) await currentWorker.steer(msg);
+        },
+        onManualRun: async (brief) => {
+          return await handleManualRun(brief, ctx);
+        },
+      });
+    });
+  };
+
+  pi.registerShortcut("alt+s", {
+    description: "Toggle Sidekick conversation view",
+    handler: (ctx) => openSidekickView(ctx),
+  });
+
+  pi.registerCommand("sidekick_view", {
+    description: "Open Sidekick interactive conversation view",
+    handler: (_args, ctx) => openSidekickView(ctx),
+  });
+
   pi.registerCommand("sidekick", {
-    description: "Persistent pair: status | model provider/id [thinking] | on | off | steer text | cancel | restart | reset --yes | stats",
+    description: "Persistent pair: status | view | model provider/id [thinking] | on | off | steer text | cancel | restart | reset --yes | stats",
     async handler(args, ctx) {
       const [command = "status", ...rest] = args.trim().split(/\s+/).filter(Boolean);
       try {
+        if (command === "view") { await openSidekickView(ctx); return; }
         if (command === "status") {
           const cp = worker?.checkpoint;
           ctx.ui.notify([
@@ -173,10 +356,21 @@ export default function sidekickExtension(pi: ExtensionAPI): void {
         if (worker?.busy || writerLeases.size) throw new Error("Workspace is busy; cancel or wait before changing Sidekick configuration/history");
         if (command === "reset") {
           if (rest[0] !== "--yes" && (!ctx.hasUI || !(await ctx.ui.confirm("Reset Sidekick history?", "Create new history on the next handoff. Existing files and the old JSONL will NOT be deleted or reverted.")))) return;
+          manualRunGeneration++;
+          activeViewDone?.();
+          activeViewDone = undefined;
           await worker?.stop(); append(CHECKPOINT_TYPE, null); worker = createWorker(ctx);
+          viewDraft = ""; viewScrollTop = 0;
           ctx.ui.notify("Sidekick binding reset. Files and old history retained.", "info"); return;
         }
-        if (command === "restart") { await worker?.stop(); worker = createWorker(ctx); ctx.ui.notify("Sidekick process stopped; next handoff restores its existing history.", "info"); return; }
+        if (command === "restart") {
+          manualRunGeneration++;
+          activeViewDone?.();
+          activeViewDone = undefined;
+          await worker?.stop(); worker = createWorker(ctx);
+          ctx.ui.notify("Sidekick process stopped; next handoff restores its existing history.", "info");
+          return;
+        }
         let next: SidekickConfig;
         if (command === "model") {
           if (!rest[0] || rest.length > 2) throw new Error("Usage: /sidekick model provider/model-id [thinking]");

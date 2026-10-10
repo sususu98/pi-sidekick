@@ -1,10 +1,12 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
-import lockfile from "proper-lockfile";
+import { join, resolve } from "node:path";
+import { acquireFileLock, type FileLockRelease } from "./lock.ts";
 import { getAgentDir, getPackageDir, SessionManager, type JsonAgentSessionEvent, type SessionEntry, type SessionStats } from "@earendil-works/pi-coding-agent";
 import type { Usage } from "@earendil-works/pi-ai";
 import { sameModel, resolveProviderExtensions, type SidekickConfig, type SidekickModel } from "./config.ts";
 import { RpcPeer } from "./rpc.ts";
+import { TranscriptProjection } from "./ui/projection.ts";
+import type { SidekickViewState } from "./ui/types.ts";
 import { collectUsage, totalUsage, zeroUsage } from "./usage.ts";
 
 export const CHECKPOINT_TYPE = "pi-sidekick.checkpoint.v1";
@@ -51,18 +53,51 @@ interface WorkerOptions {
 
 export class PersistentWorker {
   checkpoint?: Checkpoint;
+  readonly projection = new TranscriptProjection();
   private peer?: RpcPeer;
-  private fileRelease?: () => Promise<void>;
+  private fileRelease?: FileLockRelease;
   private operation?: { controller: AbortController; done: Promise<WorkerResult> };
   private closing = false;
   private compromised?: Error;
-  constructor(private readonly options: WorkerOptions) { this.checkpoint = options.checkpoint; }
+  constructor(private readonly options: WorkerOptions) {
+    this.checkpoint = options.checkpoint;
+    this.projection.setModel(options.config.sidekick);
+    if (options.checkpoint?.tasks) this.projection.setTasks(options.checkpoint.tasks);
+    if (options.checkpoint?.stats) this.projection.setUsage(options.checkpoint.stats.tokens as any);
+  }
   get busy(): boolean { return Boolean(this.operation); }
   get pid(): number | undefined { return this.peer?.pid; }
+  get isProcessRunning(): boolean { return Boolean(this.peer); }
 
-  private async lock(path: string, onCompromised: () => void): Promise<() => Promise<void>> {
-    await mkdir(dirname(path), { recursive: true });
-    try { return await lockfile.lock(path, { realpath: false, stale: 10_000, update: 2000, retries: 0, onCompromised: (error) => { this.compromised = error; onCompromised(); } }); }
+  async hydrateView(): Promise<TranscriptProjection> {
+    if (this.peer) {
+      return this.projection;
+    }
+    const checkpoint = this.checkpoint;
+    if (!checkpoint) {
+      this.projection.clear();
+      this.projection.setStatus("idle");
+      return this.projection;
+    }
+    const branchEntries = await TranscriptProjection.loadColdBranch(
+      checkpoint.file,
+      checkpoint.sessionId,
+      this.options.cwd,
+      checkpoint.leaf
+    );
+    this.projection.seedFromEntries(branchEntries);
+    this.projection.setStatus(checkpoint.status === "running" ? "running" : "idle");
+    this.projection.setTasks(checkpoint.tasks);
+    if (checkpoint.stats) this.projection.setUsage(checkpoint.stats.tokens as any);
+    return this.projection;
+  }
+
+  getViewSnapshot(): SidekickViewState {
+    return this.projection.getSnapshot();
+  }
+
+  private async lock(path: string, onCompromised: () => void): Promise<FileLockRelease> {
+    try { return await acquireFileLock(path, { stale: 10_000, update: 2000, onCompromised: (error) => { this.compromised = error; onCompromised(); } }); }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ELOCKED") throw new Error(`Another Sidekick writer owns ${path}. Do not open a second writer.`);
       throw error;
@@ -120,7 +155,7 @@ export class PersistentWorker {
         "--session-dir", this.options.sessionDir, ...(checkpoint ? ["--session", checkpoint.file] : [])],
       requestTimeoutMs: 5000,
     });
-    let release: (() => Promise<void>) | undefined;
+    let release: FileLockRelease | undefined;
     try {
       // When restoring, claim the JSONL before starting any process that may write it.
       release = await this.lock(checkpoint.file, () => this.operation?.controller.abort(new Error("Sidekick session lock compromised")));
@@ -156,6 +191,7 @@ export class PersistentWorker {
     const started = performance.now();
     let workspaceRelease: (() => Promise<void>) | undefined;
     let unsubscribe = () => {};
+    let unsubProjection = () => {};
     let abortWork: Promise<void> | undefined;
     let cursor: string | undefined;
     let initialized = false;
@@ -178,6 +214,19 @@ export class PersistentWorker {
       controller.signal.throwIfAborted();
       const running: Checkpoint = { ...this.checkpoint!, status: "running" };
       this.options.save(running); this.checkpoint = running;
+      this.projection.setStatus("running");
+      if (this.checkpoint?.file && this.checkpoint?.sessionId) {
+        const branchEntries = await TranscriptProjection.loadColdBranch(
+          this.checkpoint.file,
+          this.checkpoint.sessionId,
+          this.options.cwd,
+          this.checkpoint.leaf
+        );
+        this.projection.seedFromEntries(branchEntries);
+      }
+      unsubProjection = peer.onEvent((event: JsonAgentSessionEvent) => {
+        this.projection.handleEvent(event);
+      });
       unsubscribe = peer.onEvent((event: JsonAgentSessionEvent) => {
         if (event.type === "tool_execution_start") progress(`Running ${event.toolName}`);
         else if (event.type === "tool_execution_end") progress(`${event.isError ? "Failed" : "Finished"} ${event.toolName}`);
@@ -210,7 +259,7 @@ export class PersistentWorker {
       await this.peer?.stop(); this.peer = undefined;
       report = `Sidekick ${status}: ${String(error)}. Its history is retained; files may already have changed. Review partial work before assigning a new brief. The interrupted task was not re-run.`;
     } finally {
-      unsubscribe(); controller.signal.removeEventListener("abort", cancel);
+      unsubscribe(); unsubProjection(); controller.signal.removeEventListener("abort", cancel);
       try {
         if (initialized && this.checkpoint) {
           try { usage = await this.snapshot(cursor, status); }
@@ -228,12 +277,20 @@ export class PersistentWorker {
     }
     const limit = this.options.config.maxReportChars;
     if (report.length > limit) report = report.slice(0, limit) + "\n[Report truncated. Full final report remains in the Sidekick session; raw traces were not copied to Lead.]";
-    return { status, report, checkpoint: this.checkpoint, usage, durationMs: Math.round(performance.now() - started) };
+    const durationMs = Math.round(performance.now() - started);
+    this.projection.setStatus(status === "cancelled" ? "cancelled" : status === "error" ? "error" : "idle");
+    if (this.checkpoint?.tasks) this.projection.setTasks(this.checkpoint.tasks);
+    if (usage) this.projection.setUsage(usage);
+    this.projection.setDurationMs(durationMs);
+    return { status, report, checkpoint: this.checkpoint, usage, durationMs };
   }
 
   private async release(release: (() => Promise<void>) | undefined): Promise<void> {
     try { await release?.(); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ERELEASED") throw error; }
+    catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ERELEASED" && code !== "ECOMPROMISED" && code !== "ENOTACQUIRED") throw error;
+    }
   }
 
   private async snapshot(cursor: string | undefined, status: WorkerStatus): Promise<Usage> {

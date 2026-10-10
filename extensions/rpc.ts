@@ -124,6 +124,10 @@ export class RpcPeer {
   getEntries(since?: string): Promise<{ entries: SessionEntry[]; leafId: string | null }> { return this.request({ type: "get_entries", since }); }
   getLastAssistantText(): Promise<{ text: string | null }> { return this.request({ type: "get_last_assistant_text" }); }
   getSessionStats(): Promise<SessionStats> { return this.request({ type: "get_session_stats" }); }
+  async getMessages(): Promise<unknown[]> {
+    const res = (await this.request({ type: "get_messages" })) as { messages: unknown[] };
+    return res.messages;
+  }
   clearQueue() { return this.request({ type: "clear_queue" }); }
   abort() { return this.request({ type: "abort" }); }
   steer(message: string) { return this.request({ type: "steer", message }); }
