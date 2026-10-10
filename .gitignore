@@ -3,3 +3,5 @@ node_modules/
 *.log
 .pi/sidekick-writer.lock/
 .pi/sidekick-writer.lock.gate/
+
+.pi/
